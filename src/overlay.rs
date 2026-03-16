@@ -18,6 +18,7 @@ pub enum OverlayCmd {
     Hide,
     UpdateConfig {
         color: (u8, u8, u8),
+        #[allow(dead_code)]
         opacity: f32,
         font_name: String,
         font_size: u32,
@@ -31,10 +32,12 @@ pub fn send_cmd(cmd: OverlayCmd) {
     }
 }
 
+#[allow(dead_code)]
 pub fn show_suggestion(s: &str) {
     send_cmd(OverlayCmd::Show(s.to_string()));
 }
 
+#[allow(dead_code)]
 pub fn hide_suggestion() {
     send_cmd(OverlayCmd::Hide);
 }
@@ -111,7 +114,7 @@ pub fn run_overlay_thread(rx: Receiver<OverlayCmd>, tx: Sender<OverlayCmd>) {
         }
 
         if let Some(state) = OVERLAY_STATE.take() {
-            DeleteObject(state.font);
+            let _ = DeleteObject(state.font);
         }
     }
 }
@@ -146,19 +149,19 @@ unsafe fn process_commands() {
                 state.text = text;
                 state.visible = true;
                 position_near_caret(state);
-                ShowWindow(state.hwnd, SW_SHOWNOACTIVATE);
-                RedrawWindow(state.hwnd, None, None, RDW_INVALIDATE | RDW_ERASE);
+                let _ = ShowWindow(state.hwnd, SW_SHOWNOACTIVATE);
+                let _ = RedrawWindow(state.hwnd, None, None, RDW_INVALIDATE | RDW_ERASE);
             }
             OverlayCmd::Hide => {
                 if state.visible {
                     state.visible = false;
-                    ShowWindow(state.hwnd, SW_HIDE);
+                    let _ = ShowWindow(state.hwnd, SW_HIDE);
                 }
             }
             OverlayCmd::UpdateConfig { color, opacity: _, font_name, font_size } => {
                 state.color = color;
                 if state.font_name != font_name || state.font_size != font_size {
-                    DeleteObject(state.font);
+                    let _ = DeleteObject(state.font);
                     state.font = create_font(&font_name, font_size);
                     state.font_name = font_name;
                     state.font_size = font_size;
@@ -188,7 +191,7 @@ unsafe fn position_near_caret(state: &OverlayState) {
                     x: rc.left,
                     y: rc.bottom + 2,
                 };
-                ClientToScreen(gui_info.hwndCaret, &mut pt);
+                let _ = ClientToScreen(gui_info.hwndCaret, &mut pt);
                 let _ = SetWindowPos(
                     state.hwnd,
                     HWND_TOPMOST,
@@ -234,8 +237,8 @@ unsafe extern "system" fn overlay_wnd_proc(
             let bg_brush = CreateSolidBrush(COLORREF(COLORKEY));
             let mut rc = RECT::default();
             GetClientRect(hwnd, &mut rc).ok();
-            FillRect(hdc, &rc, bg_brush);
-            DeleteObject(bg_brush);
+            let _ = FillRect(hdc, &rc, bg_brush);
+            let _ = DeleteObject(bg_brush);
 
             if let Some(state) = OVERLAY_STATE.as_ref() {
                 if !state.text.is_empty() {
@@ -247,10 +250,10 @@ unsafe extern "system" fn overlay_wnd_proc(
                     ));
 
                     let wide: Vec<u16> = state.text.encode_utf16().collect();
-                    TextOutW(hdc, 4, 4, &wide);
+                    let _ = TextOutW(hdc, 4, 4, &wide);
 
                     let mut text_size = SIZE::default();
-                    GetTextExtentPoint32W(hdc, &wide, &mut text_size);
+                    let _ = GetTextExtentPoint32W(hdc, &wide, &mut text_size);
                     let new_w = text_size.cx + 12;
                     let new_h = text_size.cy + 10;
                     let _ = SetWindowPos(
@@ -265,7 +268,7 @@ unsafe extern "system" fn overlay_wnd_proc(
                 }
             }
 
-            EndPaint(hwnd, &ps);
+            let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
         WM_DESTROY => {

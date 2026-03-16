@@ -25,3 +25,8 @@ features = [
   "Win32_Graphics_Gdi",
   "Win32_UI_Accessibility",
 ]
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

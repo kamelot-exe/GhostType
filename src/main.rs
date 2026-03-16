@@ -1,3 +1,5 @@
+#![allow(static_mut_refs)]
+
 mod config;
 mod db;
 mod hook;

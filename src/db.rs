@@ -116,6 +116,7 @@ impl SuggestionDb {
     }
 
     /// Get next word predictions given two context words (trigram lookup)
+    #[allow(dead_code)]
     pub fn trigram_predict(&self, w1: &str, w2: &str, prefix: &str, limit: usize) -> Vec<(String, i64)> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -129,6 +130,7 @@ impl SuggestionDb {
     }
 
     /// Get next word predictions given one context word (bigram lookup)
+    #[allow(dead_code)]
     pub fn bigram_predict(&self, w1: &str, prefix: &str, limit: usize) -> Vec<(String, i64)> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -142,6 +144,7 @@ impl SuggestionDb {
     }
 
     /// Get word completions by prefix (unigram lookup)
+    #[allow(dead_code)]
     pub fn unigram_predict(&self, prefix: &str, limit: usize) -> Vec<(String, i64)> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -219,67 +222,9 @@ impl SuggestionDb {
         map
     }
 
-    #[allow(dead_code)]
-    // Legacy methods kept for compatibility
-    pub fn add_word(&self, word: &str) -> Result<()> {
-        let ts = now_ts();
-        self.add_word_with_ts(word, ts, 1)
-    }
-
-    pub fn add_phrase(&self, phrase: &str) -> Result<()> {
-        let ts = now_ts();
-        self.add_phrase_with_ts(phrase, ts, 1)
-    }
-
-    pub fn add_word_with_ts(&self, word: &str, ts: i64, inc: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            r#"INSERT INTO words(word, freq, last_used) VALUES (?1, ?2, ?3)
-               ON CONFLICT(word) DO UPDATE SET freq = freq + excluded.freq, last_used = excluded.last_used"#,
-            params![word, inc, ts],
-        )?;
-        Ok(())
-    }
-
-    pub fn add_phrase_with_ts(&self, phrase: &str, ts: i64, inc: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            r#"INSERT INTO phrases(phrase, freq, last_used) VALUES (?1, ?2, ?3)
-               ON CONFLICT(phrase) DO UPDATE SET freq = freq + excluded.freq, last_used = excluded.last_used"#,
-            params![phrase, inc, ts],
-        )?;
-        Ok(())
-    }
-
-    pub fn best_word_match(&self, prefix: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT word FROM words WHERE word LIKE (?1 || '%') AND word != ?1
-             ORDER BY freq DESC, last_used DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query(params![prefix])?;
-        if let Some(row) = rows.next()? {
-            Ok(Some(row.get(0)?))
-        } else {
-            Ok(None)
-        }
-    }
-
-    pub fn best_phrase_match(&self, prefix: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT phrase FROM phrases WHERE phrase LIKE (?1 || '%') AND phrase != ?1
-             ORDER BY freq DESC, last_used DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query(params![prefix])?;
-        if let Some(row) = rows.next()? {
-            Ok(Some(row.get(0)?))
-        } else {
-            Ok(None)
-        }
-    }
 }
 
+#[allow(dead_code)]
 fn now_ts() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
