@@ -170,6 +170,56 @@ impl SuggestionDb {
         conn.query_row("SELECT COUNT(*) FROM trigrams", [], |r| r.get(0)).unwrap_or(0)
     }
 
+    /// Load all unigrams into memory
+    pub fn load_all_unigrams(&self) -> HashMap<String, i64> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT word, freq FROM unigrams").unwrap();
+        let mut map = HashMap::new();
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }).unwrap();
+        for r in rows.flatten() {
+            map.insert(r.0, r.1);
+        }
+        map
+    }
+
+    /// Load all bigrams grouped by w1
+    pub fn load_all_bigrams(&self) -> HashMap<String, Vec<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT w1, w2, freq FROM bigrams ORDER BY w1, freq DESC").unwrap();
+        let mut map: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        }).unwrap();
+        for r in rows.flatten() {
+            map.entry(r.0).or_default().push((r.1, r.2));
+        }
+        // Truncate each to top 10
+        for entries in map.values_mut() {
+            entries.truncate(10);
+        }
+        map
+    }
+
+    /// Load all trigrams grouped by (w1, w2)
+    pub fn load_all_trigrams(&self) -> HashMap<(String, String), Vec<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT w1, w2, w3, freq FROM trigrams ORDER BY w1, w2, freq DESC").unwrap();
+        let mut map: HashMap<(String, String), Vec<(String, i64)>> = HashMap::new();
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?))
+        }).unwrap();
+        for r in rows.flatten() {
+            map.entry((r.0, r.1)).or_default().push((r.2, r.3));
+        }
+        for entries in map.values_mut() {
+            entries.truncate(10);
+        }
+        map
+    }
+
+    #[allow(dead_code)]
     // Legacy methods kept for compatibility
     pub fn add_word(&self, word: &str) -> Result<()> {
         let ts = now_ts();

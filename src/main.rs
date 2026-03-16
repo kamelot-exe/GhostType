@@ -2,6 +2,7 @@ mod config;
 mod db;
 mod hook;
 mod input;
+mod ngram_cache;
 mod overlay;
 mod state;
 mod suggest;
@@ -12,19 +13,25 @@ use crate::config::Config;
 use crate::db::SuggestionDb;
 use crate::hook::{run_hook_loop, ACCEPT_VK};
 use crate::input::{resolve_char, KeyEvent};
+use crate::ngram_cache::NgramCache;
 use crate::overlay::OverlayCmd;
 use crate::state::AppState;
-use crate::suggest::{finalize_phrase_and_word, refresh_suggestion};
+use crate::suggest::{finalize_buffer, refresh_suggestion};
 use crate::ui::{EngineCmd, GhostTypeApp};
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use eframe::egui;
 use std::env;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use eframe::egui;
+use windows::Win32::Foundation::HWND;
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
 };
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 const DEBOUNCE_MS: u64 = 30;
 
@@ -88,7 +95,7 @@ fn main() {
         );
     });
 
-    // Thread 4: UI (runs on main thread for egui compatibility)
+    // Thread 4: UI (runs on main thread for egui/winit compatibility)
     println!("Opening settings UI...");
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -112,7 +119,7 @@ fn main() {
     );
 
     // UI closed — shut down overlay
-    let _ = overlay::send_cmd(OverlayCmd::Quit);
+    overlay::send_cmd(OverlayCmd::Quit);
 }
 
 fn run_engine(
@@ -130,6 +137,16 @@ fn run_engine(
     let mut config = initial_config;
     let mut last_suggestion_time = Instant::now();
 
+    // Load n-gram cache into memory
+    println!("Loading n-gram cache...");
+    let mut cache = NgramCache::load_from_db(&db);
+    println!(
+        "Cache loaded: {} unigrams, {} bigram keys, {} trigram keys",
+        cache.unigrams.len(),
+        cache.bigrams.len(),
+        cache.trigrams.len()
+    );
+
     loop {
         // Check engine commands (non-blocking)
         while let Ok(cmd) = engine_cmd_rx.try_recv() {
@@ -145,6 +162,11 @@ fn run_engine(
                     state.engine_running = config.engine_enabled;
                     state.overlay_visible = config.overlay_enabled;
                 }
+                EngineCmd::RefreshCache => {
+                    println!("Refreshing n-gram cache...");
+                    cache.refresh(&db);
+                    println!("Cache refreshed.");
+                }
             }
         }
 
@@ -154,7 +176,20 @@ fn run_engine(
                 if !state.engine_running {
                     continue;
                 }
-                handle_event(&db, &mut state, &config, event, &overlay_tx, &mut last_suggestion_time);
+
+                // Check if foreground app is in ignored list
+                if !config.ignored_apps.is_empty() {
+                    if let Some(proc_name) = get_foreground_process_name() {
+                        let proc_lower = proc_name.to_lowercase();
+                        if config.ignored_apps.iter().any(|app| proc_lower.contains(&app.to_lowercase())) {
+                            continue;
+                        }
+                    }
+                }
+
+                handle_event(
+                    &cache, &mut state, event, &overlay_tx, &mut last_suggestion_time,
+                );
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -162,10 +197,37 @@ fn run_engine(
     }
 }
 
+fn get_foreground_process_name() -> Option<String> {
+    unsafe {
+        let hwnd: HWND = GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return None;
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return None;
+        }
+
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 260];
+        let mut len = buf.len() as u32;
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        ).ok()?;
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        path.rsplit('\\').next().map(|s| s.to_string())
+    }
+}
+
 fn handle_event(
-    db: &SuggestionDb,
+    cache: &NgramCache,
     state: &mut AppState,
-    _config: &Config,
     event: KeyEvent,
     overlay_tx: &Sender<OverlayCmd>,
     last_time: &mut Instant,
@@ -183,23 +245,19 @@ fn handle_event(
 
     match event.vk_code {
         0x08 => {
-            // Backspace
             state.typed_buffer.pop();
         }
         0x0D => {
-            // Enter
-            finalize_phrase_and_word(db, state);
+            finalize_buffer(state);
             let _ = overlay_tx.send(OverlayCmd::Hide);
             return;
         }
         0x1B => {
-            // Escape — dismiss suggestion
             state.clear_suggestion();
             let _ = overlay_tx.send(OverlayCmd::Hide);
             return;
         }
         0x20 => {
-            // Space
             state.typed_buffer.push(' ');
         }
         _ => {
@@ -228,14 +286,14 @@ fn handle_event(
         state.typed_buffer = tail;
     }
 
-    // Debounce suggestion refresh
+    // Debounce
     let now = Instant::now();
     if now.duration_since(*last_time) < Duration::from_millis(DEBOUNCE_MS) {
         return;
     }
     *last_time = now;
 
-    refresh_suggestion(db, state);
+    refresh_suggestion(cache, state);
 
     if state.overlay_visible {
         if let Some(suffix) = &state.current_suffix {
@@ -250,7 +308,7 @@ fn send_unicode_text(text: &str) {
     let mut inputs: Vec<INPUT> = Vec::new();
 
     for unit in text.encode_utf16() {
-        let key_down = INPUT {
+        inputs.push(INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
@@ -261,9 +319,8 @@ fn send_unicode_text(text: &str) {
                     dwExtraInfo: 0,
                 },
             },
-        };
-
-        let key_up = INPUT {
+        });
+        inputs.push(INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
@@ -274,10 +331,7 @@ fn send_unicode_text(text: &str) {
                     dwExtraInfo: 0,
                 },
             },
-        };
-
-        inputs.push(key_down);
-        inputs.push(key_up);
+        });
     }
 
     unsafe {

@@ -22,6 +22,7 @@ pub enum EngineCmd {
     Start,
     Stop,
     UpdateConfig(Config),
+    RefreshCache,
 }
 
 #[derive(Default, Debug)]
@@ -186,6 +187,7 @@ impl eframe::App for GhostTypeApp {
                                         stats.messages, stats.unigrams, stats.bigrams, stats.trigrams
                                     );
                                     self.refresh_stats();
+                                    let _ = self.engine_tx.send(EngineCmd::RefreshCache);
                                 }
                                 Err(e) => {
                                     self.import_status = format!("Import error: {e}");
@@ -198,6 +200,7 @@ impl eframe::App for GhostTypeApp {
                         telegram_import::import_default_files(&self.db);
                         self.import_status = "Default files imported.".into();
                         self.refresh_stats();
+                        let _ = self.engine_tx.send(EngineCmd::RefreshCache);
                     }
 
                     if ui.button("Rebuild Database").clicked() {
@@ -207,6 +210,7 @@ impl eframe::App for GhostTypeApp {
                             telegram_import::import_default_files(&self.db);
                             self.import_status = "Database rebuilt.".into();
                             self.refresh_stats();
+                            let _ = self.engine_tx.send(EngineCmd::RefreshCache);
                         }
                     }
                 });
