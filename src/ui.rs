@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, ACCEPT_KEY_OPTIONS};
 use crate::db::SuggestionDb;
 use crate::overlay::OverlayCmd;
 use crate::telegram_import;
@@ -175,24 +175,44 @@ impl eframe::App for GhostTypeApp {
 
                 ui.horizontal(|ui| {
                     if ui.button("Import Telegram JSON").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
+                        if let Some(paths) = rfd::FileDialog::new()
                             .add_filter("JSON", &["json"])
-                            .pick_file()
+                            .pick_files()
                         {
-                            let path_str = path.display().to_string();
-                            match telegram_import::import_file(&self.db, &path_str) {
-                                Ok(stats) => {
-                                    self.import_status = format!(
-                                        "Imported {} messages: {} unigrams, {} bigrams, {} trigrams",
-                                        stats.messages, stats.unigrams, stats.bigrams, stats.trigrams
-                                    );
-                                    self.refresh_stats();
-                                    let _ = self.engine_tx.send(EngineCmd::RefreshCache);
-                                }
-                                Err(e) => {
-                                    self.import_status = format!("Import error: {e}");
+                            let mut total_msgs = 0usize;
+                            let mut total_uni = 0usize;
+                            let mut total_bi = 0usize;
+                            let mut total_tri = 0usize;
+                            let mut errors = Vec::new();
+
+                            for path in &paths {
+                                let path_str = path.display().to_string();
+                                match telegram_import::import_file(&self.db, &path_str) {
+                                    Ok(stats) => {
+                                        total_msgs += stats.messages;
+                                        total_uni += stats.unigrams;
+                                        total_bi += stats.bigrams;
+                                        total_tri += stats.trigrams;
+                                    }
+                                    Err(e) => {
+                                        errors.push(format!("{}: {e}", path.display()));
+                                    }
                                 }
                             }
+
+                            if errors.is_empty() {
+                                self.import_status = format!(
+                                    "Imported {} file(s): {} messages, {} unigrams, {} bigrams, {} trigrams",
+                                    paths.len(), total_msgs, total_uni, total_bi, total_tri
+                                );
+                            } else {
+                                self.import_status = format!(
+                                    "Imported with errors: {} ok, {} failed. Errors: {}",
+                                    paths.len() - errors.len(), errors.len(), errors.join("; ")
+                                );
+                            }
+                            self.refresh_stats();
+                            let _ = self.engine_tx.send(EngineCmd::RefreshCache);
                         }
                     }
 
@@ -221,14 +241,24 @@ impl eframe::App for GhostTypeApp {
             });
 
             // Hotkeys
-            egui::CollapsingHeader::new("Hotkeys").default_open(false).show(ui, |ui| {
+            egui::CollapsingHeader::new("Hotkeys").default_open(true).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Accept suggestion:");
-                    let mut key = self.config.accept_key.clone();
-                    if ui.text_edit_singleline(&mut key).changed() {
-                        self.config.accept_key = key;
-                        self.send_config_update();
-                    }
+                    egui::ComboBox::from_id_salt("accept_key_combo")
+                        .selected_text(&self.config.accept_key)
+                        .show_ui(ui, |ui| {
+                            let mut changed = false;
+                            for &key in ACCEPT_KEY_OPTIONS {
+                                changed |= ui.selectable_value(
+                                    &mut self.config.accept_key,
+                                    key.to_string(),
+                                    key,
+                                ).changed();
+                            }
+                            if changed {
+                                self.send_config_update();
+                            }
+                        });
                 });
             });
 

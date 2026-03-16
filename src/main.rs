@@ -13,7 +13,7 @@ mod ui;
 
 use crate::config::Config;
 use crate::db::SuggestionDb;
-use crate::hook::{run_hook_loop, ACCEPT_VK};
+use crate::hook::run_hook_loop;
 use crate::input::{resolve_char, KeyEvent};
 use crate::ngram_cache::NgramCache;
 use crate::overlay::OverlayCmd;
@@ -31,7 +31,8 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    KEYEVENTF_UNICODE, VK_CONTROL, VK_RETURN, VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
@@ -190,7 +191,7 @@ fn run_engine(
                 }
 
                 handle_event(
-                    &cache, &mut state, event, &overlay_tx, &mut last_suggestion_time,
+                    &cache, &mut state, &config, event, &overlay_tx, &mut last_suggestion_time,
                 );
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
@@ -227,15 +228,35 @@ fn get_foreground_process_name() -> Option<String> {
     }
 }
 
+fn is_ctrl_pressed() -> bool {
+    unsafe { (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 }
+}
+
+fn is_accept_key(event: &KeyEvent, config: &Config) -> bool {
+    let accept_vk = config.accept_vk();
+    match accept_vk {
+        0xFF01 => {
+            // Ctrl+Space
+            event.vk_code == VK_SPACE.0 as u32 && is_ctrl_pressed()
+        }
+        0xFF02 => {
+            // Ctrl+Enter
+            event.vk_code == VK_RETURN.0 as u32 && is_ctrl_pressed()
+        }
+        vk => event.vk_code == vk,
+    }
+}
+
 fn handle_event(
     cache: &NgramCache,
     state: &mut AppState,
+    config: &Config,
     event: KeyEvent,
     overlay_tx: &Sender<OverlayCmd>,
     last_time: &mut Instant,
 ) {
     // Accept suggestion
-    if event.vk_code == ACCEPT_VK {
+    if is_accept_key(&event, config) {
         if let Some(suffix) = state.current_suffix.clone() {
             send_unicode_text(&suffix);
             state.typed_buffer.push_str(&suffix);

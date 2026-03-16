@@ -4,7 +4,6 @@ use once_cell::sync::OnceCell;
 use windows::core::Error;
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_TAB;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
     UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
@@ -49,4 +48,3 @@ pub fn run_hook_loop(tx: Sender<KeyEvent>) -> Result<(), Error> {
     Ok(())
 }
 
-pub const ACCEPT_VK: u32 = VK_TAB.0 as u32;

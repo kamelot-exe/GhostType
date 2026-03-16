@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
+use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
 const CONFIG_PATH: &str = "config.toml";
 
@@ -82,6 +83,11 @@ impl Config {
         }
     }
 
+    /// Convert accept_key string to Win32 virtual key code
+    pub fn accept_vk(&self) -> u32 {
+        key_name_to_vk(&self.accept_key)
+    }
+
     pub fn parse_color(&self) -> (u8, u8, u8) {
         let hex = self.color.trim_start_matches('#');
         if hex.len() == 6 {
@@ -92,5 +98,37 @@ impl Config {
         } else {
             (160, 160, 160)
         }
+    }
+}
+
+pub const ACCEPT_KEY_OPTIONS: &[&str] = &[
+    "Tab",
+    "Right Arrow",
+    "Insert",
+    "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+    "Ctrl+Space",
+    "Ctrl+Enter",
+];
+
+pub fn key_name_to_vk(name: &str) -> u32 {
+    match name.trim() {
+        "Tab" => VK_TAB.0 as u32,
+        "Right Arrow" => VK_RIGHT.0 as u32,
+        "Insert" => VK_INSERT.0 as u32,
+        "F1" => VK_F1.0 as u32,
+        "F2" => VK_F2.0 as u32,
+        "F3" => VK_F3.0 as u32,
+        "F4" => VK_F4.0 as u32,
+        "F5" => VK_F5.0 as u32,
+        "F6" => VK_F6.0 as u32,
+        "F7" => VK_F7.0 as u32,
+        "F8" => VK_F8.0 as u32,
+        "F9" => VK_F9.0 as u32,
+        "F10" => VK_F10.0 as u32,
+        "F11" => VK_F11.0 as u32,
+        "F12" => VK_F12.0 as u32,
+        "Ctrl+Space" => 0xFF01, // Custom sentinel, handled in engine
+        "Ctrl+Enter" => 0xFF02, // Custom sentinel, handled in engine
+        _ => VK_TAB.0 as u32,
     }
 }

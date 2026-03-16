@@ -176,22 +176,27 @@ unsafe fn process_commands() {
 
 unsafe fn position_near_caret(state: &OverlayState) {
     let fg = GetForegroundWindow();
-    if !fg.is_invalid() {
-        let fg_thread = GetWindowThreadProcessId(fg, None);
+    if fg.is_invalid() {
+        return;
+    }
 
-        let mut gui_info = GUITHREADINFO {
-            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
-            ..Default::default()
-        };
+    // Strategy 1: Try to get the Win32 caret position (works in Notepad, classic apps)
+    let fg_thread = GetWindowThreadProcessId(fg, None);
+    let mut gui_info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
 
-        if GetGUIThreadInfo(fg_thread, &mut gui_info).is_ok() {
-            let rc = gui_info.rcCaret;
-            if rc.right > 0 || rc.bottom > 0 {
-                let mut pt = POINT {
-                    x: rc.left,
-                    y: rc.bottom + 2,
-                };
-                let _ = ClientToScreen(gui_info.hwndCaret, &mut pt);
+    if GetGUIThreadInfo(fg_thread, &mut gui_info).is_ok() {
+        let rc = gui_info.rcCaret;
+        if (rc.right > 0 || rc.bottom > 0) && !gui_info.hwndCaret.is_invalid() {
+            let mut pt = POINT {
+                x: rc.left,
+                y: rc.bottom + 4,
+            };
+            let _ = ClientToScreen(gui_info.hwndCaret, &mut pt);
+            // Sanity check: caret should be on screen
+            if pt.x > 0 && pt.y > 0 && pt.x < 4000 && pt.y < 3000 {
                 let _ = SetWindowPos(
                     state.hwnd,
                     HWND_TOPMOST,
@@ -203,15 +208,19 @@ unsafe fn position_near_caret(state: &OverlayState) {
         }
     }
 
-    // Fallback: near mouse cursor
-    let mut cursor_pos = POINT::default();
-    if GetCursorPos(&mut cursor_pos).is_ok() {
+    // Strategy 2: Position at bottom-center of the focused window's client area
+    // This works for Chrome, Telegram, Electron apps etc.
+    let mut win_rect = RECT::default();
+    if GetWindowRect(fg, &mut win_rect).is_ok() {
+        // Place overlay just below the window, horizontally centered
+        let win_width = win_rect.right - win_rect.left;
+        let x = win_rect.left + win_width / 3;
+        let y = win_rect.bottom - 50; // 50px from bottom of window
+
         let _ = SetWindowPos(
             state.hwnd,
             HWND_TOPMOST,
-            cursor_pos.x + 20,
-            cursor_pos.y + 20,
-            0, 0,
+            x, y, 0, 0,
             SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
