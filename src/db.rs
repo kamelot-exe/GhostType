@@ -1,43 +1,176 @@
 use rusqlite::{params, Connection, Result};
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct SuggestionDb {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 impl SuggestionDb {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
-        let db = Self { conn };
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        let db = Self { conn: Mutex::new(conn) };
         db.init()?;
         Ok(db)
     }
 
     fn init(&self) -> Result<()> {
-        self.conn.execute_batch(
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
             r#"
+            CREATE TABLE IF NOT EXISTS unigrams (
+                word TEXT PRIMARY KEY,
+                freq INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE INDEX IF NOT EXISTS idx_unigrams_freq ON unigrams(freq DESC);
+
+            CREATE TABLE IF NOT EXISTS bigrams (
+                w1 TEXT NOT NULL,
+                w2 TEXT NOT NULL,
+                freq INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (w1, w2)
+            );
+            CREATE INDEX IF NOT EXISTS idx_bigrams_w1 ON bigrams(w1, freq DESC);
+
+            CREATE TABLE IF NOT EXISTS trigrams (
+                w1 TEXT NOT NULL,
+                w2 TEXT NOT NULL,
+                w3 TEXT NOT NULL,
+                freq INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (w1, w2, w3)
+            );
+            CREATE INDEX IF NOT EXISTS idx_trigrams_w1w2 ON trigrams(w1, w2, freq DESC);
+
+            -- Keep legacy tables for backward compat during migration
             CREATE TABLE IF NOT EXISTS words (
                 word TEXT PRIMARY KEY,
                 freq INTEGER NOT NULL DEFAULT 1,
                 last_used INTEGER NOT NULL
             );
-
             CREATE TABLE IF NOT EXISTS phrases (
                 phrase TEXT PRIMARY KEY,
                 freq INTEGER NOT NULL DEFAULT 1,
                 last_used INTEGER NOT NULL
             );
-
-            CREATE INDEX IF NOT EXISTS idx_words_freq
-            ON words(freq DESC, last_used DESC);
-
-            CREATE INDEX IF NOT EXISTS idx_phrases_freq
-            ON phrases(freq DESC, last_used DESC);
             "#,
         )?;
         Ok(())
     }
 
+    pub fn clear_ngrams(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            "DELETE FROM unigrams; DELETE FROM bigrams; DELETE FROM trigrams;",
+        )?;
+        Ok(())
+    }
+
+    pub fn batch_insert_unigrams(&self, counts: &HashMap<String, i64>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO unigrams(word, freq) VALUES (?1, ?2)
+                 ON CONFLICT(word) DO UPDATE SET freq = freq + excluded.freq",
+            )?;
+            for (word, count) in counts {
+                stmt.execute(params![word, count])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn batch_insert_bigrams(&self, counts: &HashMap<(String, String), i64>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO bigrams(w1, w2, freq) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(w1, w2) DO UPDATE SET freq = freq + excluded.freq",
+            )?;
+            for ((w1, w2), count) in counts {
+                stmt.execute(params![w1, w2, count])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn batch_insert_trigrams(&self, counts: &HashMap<(String, String, String), i64>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO trigrams(w1, w2, w3, freq) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(w1, w2, w3) DO UPDATE SET freq = freq + excluded.freq",
+            )?;
+            for ((w1, w2, w3), count) in counts {
+                stmt.execute(params![w1, w2, w3, count])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Get next word predictions given two context words (trigram lookup)
+    pub fn trigram_predict(&self, w1: &str, w2: &str, prefix: &str, limit: usize) -> Vec<(String, i64)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT w3, freq FROM trigrams
+             WHERE w1 = ?1 AND w2 = ?2 AND w3 LIKE (?3 || '%')
+             ORDER BY freq DESC LIMIT ?4",
+        ).unwrap();
+        stmt.query_map(params![w1, w2, prefix, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }).unwrap().filter_map(|r| r.ok()).collect()
+    }
+
+    /// Get next word predictions given one context word (bigram lookup)
+    pub fn bigram_predict(&self, w1: &str, prefix: &str, limit: usize) -> Vec<(String, i64)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT w2, freq FROM bigrams
+             WHERE w1 = ?1 AND w2 LIKE (?2 || '%')
+             ORDER BY freq DESC LIMIT ?3",
+        ).unwrap();
+        stmt.query_map(params![w1, prefix, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }).unwrap().filter_map(|r| r.ok()).collect()
+    }
+
+    /// Get word completions by prefix (unigram lookup)
+    pub fn unigram_predict(&self, prefix: &str, limit: usize) -> Vec<(String, i64)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT word, freq FROM unigrams
+             WHERE word LIKE (?1 || '%') AND word != ?1
+             ORDER BY freq DESC LIMIT ?2",
+        ).unwrap();
+        stmt.query_map(params![prefix, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }).unwrap().filter_map(|r| r.ok()).collect()
+    }
+
+    /// Count entries for stats display
+    pub fn count_unigrams(&self) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM unigrams", [], |r| r.get(0)).unwrap_or(0)
+    }
+
+    pub fn count_bigrams(&self) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM bigrams", [], |r| r.get(0)).unwrap_or(0)
+    }
+
+    pub fn count_trigrams(&self) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM trigrams", [], |r| r.get(0)).unwrap_or(0)
+    }
+
+    // Legacy methods kept for compatibility
     pub fn add_word(&self, word: &str) -> Result<()> {
         let ts = now_ts();
         self.add_word_with_ts(word, ts, 1)
@@ -49,70 +182,48 @@ impl SuggestionDb {
     }
 
     pub fn add_word_with_ts(&self, word: &str, ts: i64, inc: i64) -> Result<()> {
-        self.conn.execute(
-            r#"
-            INSERT INTO words(word, freq, last_used)
-            VALUES (?1, ?2, ?3)
-            ON CONFLICT(word) DO UPDATE SET
-                freq = freq + excluded.freq,
-                last_used = excluded.last_used
-            "#,
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"INSERT INTO words(word, freq, last_used) VALUES (?1, ?2, ?3)
+               ON CONFLICT(word) DO UPDATE SET freq = freq + excluded.freq, last_used = excluded.last_used"#,
             params![word, inc, ts],
         )?;
         Ok(())
     }
 
     pub fn add_phrase_with_ts(&self, phrase: &str, ts: i64, inc: i64) -> Result<()> {
-        self.conn.execute(
-            r#"
-            INSERT INTO phrases(phrase, freq, last_used)
-            VALUES (?1, ?2, ?3)
-            ON CONFLICT(phrase) DO UPDATE SET
-                freq = freq + excluded.freq,
-                last_used = excluded.last_used
-            "#,
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"INSERT INTO phrases(phrase, freq, last_used) VALUES (?1, ?2, ?3)
+               ON CONFLICT(phrase) DO UPDATE SET freq = freq + excluded.freq, last_used = excluded.last_used"#,
             params![phrase, inc, ts],
         )?;
         Ok(())
     }
 
     pub fn best_word_match(&self, prefix: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare(
-            r#"
-            SELECT word
-            FROM words
-            WHERE word LIKE (?1 || '%')
-              AND word != ?1
-            ORDER BY freq DESC, last_used DESC
-            LIMIT 1
-            "#,
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT word FROM words WHERE word LIKE (?1 || '%') AND word != ?1
+             ORDER BY freq DESC, last_used DESC LIMIT 1",
         )?;
-
         let mut rows = stmt.query(params![prefix])?;
         if let Some(row) = rows.next()? {
-            let word: String = row.get(0)?;
-            Ok(Some(word))
+            Ok(Some(row.get(0)?))
         } else {
             Ok(None)
         }
     }
 
     pub fn best_phrase_match(&self, prefix: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare(
-            r#"
-            SELECT phrase
-            FROM phrases
-            WHERE phrase LIKE (?1 || '%')
-              AND phrase != ?1
-            ORDER BY freq DESC, last_used DESC
-            LIMIT 1
-            "#,
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT phrase FROM phrases WHERE phrase LIKE (?1 || '%') AND phrase != ?1
+             ORDER BY freq DESC, last_used DESC LIMIT 1",
         )?;
-
         let mut rows = stmt.query(params![prefix])?;
         if let Some(row) = rows.next()? {
-            let phrase: String = row.get(0)?;
-            Ok(Some(phrase))
+            Ok(Some(row.get(0)?))
         } else {
             Ok(None)
         }

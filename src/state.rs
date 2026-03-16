@@ -3,6 +3,8 @@ pub struct AppState {
     pub typed_buffer: String,
     pub current_full: Option<String>,
     pub current_suffix: Option<String>,
+    pub engine_running: bool,
+    pub overlay_visible: bool,
 }
 
 impl AppState {

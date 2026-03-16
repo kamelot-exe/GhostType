@@ -1,1 +1,4 @@
 db
+target/
+*.db
+config.toml
