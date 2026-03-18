@@ -11,7 +11,7 @@ mod suggest;
 mod telegram_import;
 mod ui;
 
-use crate::config::Config;
+use crate::config::{is_modifier_key, vk_to_name, Config};
 use crate::db::SuggestionDb;
 use crate::hook::run_hook_loop;
 use crate::input::{resolve_char, KeyEvent};
@@ -32,11 +32,9 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, VK_CONTROL, VK_RETURN, VK_SPACE,
+    KEYEVENTF_UNICODE, VK_CONTROL, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
-
-const DEBOUNCE_MS: u64 = 30;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -52,12 +50,23 @@ fn main() {
         return;
     }
 
+    // ── First-run: import embedded dataset if DB is empty ────────────────────
+    if db.count_unigrams() == 0 {
+        println!("First run detected — importing embedded dataset…");
+        let stats = telegram_import::import_embedded(&db);
+        println!(
+            "Dataset ready: {} msgs, {} unigrams, {} bigrams, {} trigrams",
+            stats.messages, stats.unigrams, stats.bigrams, stats.trigrams
+        );
+    }
+
     println!("GhostType starting...");
 
     // Channels
     let (key_tx, key_rx) = unbounded::<KeyEvent>();
     let (overlay_tx, overlay_rx) = unbounded::<OverlayCmd>();
     let (engine_cmd_tx, engine_cmd_rx) = unbounded::<EngineCmd>();
+    let (rebind_tx, rebind_rx) = unbounded::<String>();
     let overlay_tx_clone = overlay_tx.clone();
 
     // Thread 1: Keyboard Hook
@@ -76,11 +85,16 @@ fn main() {
     // Send initial config to overlay
     {
         let (r, g, b) = config.parse_color();
+        let (br, bg, bb) = config.parse_bg_color();
         let _ = overlay_tx.send(OverlayCmd::UpdateConfig {
             color: (r, g, b),
+            bg_color: (br, bg, bb),
             opacity: config.opacity,
             font_name: config.font.clone(),
             font_size: config.font_size,
+            corner_radius: config.corner_radius,
+            padding: config.padding,
+            position_mode: config.position_mode.clone(),
         });
     }
 
@@ -94,6 +108,7 @@ fn main() {
             key_rx,
             overlay_tx_engine,
             engine_cmd_rx,
+            rebind_tx,
             config_clone,
         );
     });
@@ -102,8 +117,9 @@ fn main() {
     println!("Opening settings UI...");
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 600.0])
-            .with_title("GhostType Settings"),
+            .with_inner_size([620.0, 720.0])
+            .with_min_inner_size([480.0, 420.0])
+            .with_title("GhostType"),
         ..Default::default()
     };
 
@@ -117,6 +133,7 @@ fn main() {
                 db_ui,
                 overlay_tx_clone,
                 engine_cmd_tx,
+                rebind_rx,
             )))
         }),
     );
@@ -130,6 +147,7 @@ fn run_engine(
     key_rx: Receiver<KeyEvent>,
     overlay_tx: Sender<OverlayCmd>,
     engine_cmd_rx: Receiver<EngineCmd>,
+    rebind_tx: Sender<String>,
     initial_config: Config,
 ) {
     let mut state = AppState {
@@ -139,8 +157,8 @@ fn run_engine(
     };
     let mut config = initial_config;
     let mut last_suggestion_time = Instant::now();
+    let mut rebind_mode = false;
 
-    // Load n-gram cache into memory
     println!("Loading n-gram cache...");
     let mut cache = NgramCache::load_from_db(&db);
     println!(
@@ -151,7 +169,7 @@ fn run_engine(
     );
 
     loop {
-        // Check engine commands (non-blocking)
+        // Process engine commands (non-blocking)
         while let Ok(cmd) = engine_cmd_rx.try_recv() {
             match cmd {
                 EngineCmd::Start => state.engine_running = true,
@@ -170,33 +188,76 @@ fn run_engine(
                     cache.refresh(&db);
                     println!("Cache refreshed.");
                 }
+                EngineCmd::StartRebind => {
+                    rebind_mode = true;
+                    state.clear_suggestion();
+                    let _ = overlay_tx.send(OverlayCmd::Hide);
+                }
             }
         }
 
-        // Wait for keyboard event with timeout
         match key_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(event) => {
+                // Rebind capture: grab first non-modifier key press
+                if rebind_mode {
+                    if !is_modifier_key(event.vk_code) {
+                        let key_name = build_key_string(event.vk_code);
+                        let _ = rebind_tx.send(key_name);
+                        rebind_mode = false;
+                    }
+                    continue;
+                }
+
                 if !state.engine_running {
                     continue;
                 }
 
-                // Check if foreground app is in ignored list
+                // Skip ignored apps
                 if !config.ignored_apps.is_empty() {
                     if let Some(proc_name) = get_foreground_process_name() {
                         let proc_lower = proc_name.to_lowercase();
-                        if config.ignored_apps.iter().any(|app| proc_lower.contains(&app.to_lowercase())) {
+                        if config
+                            .ignored_apps
+                            .iter()
+                            .any(|app| proc_lower.contains(&app.to_lowercase()))
+                        {
                             continue;
                         }
                     }
                 }
 
                 handle_event(
-                    &cache, &mut state, &config, event, &overlay_tx, &mut last_suggestion_time,
+                    &cache,
+                    &mut state,
+                    &config,
+                    event,
+                    &overlay_tx,
+                    &mut last_suggestion_time,
                 );
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
+    }
+}
+
+/// Build human-readable key string with current modifier state.
+/// Examples: "Tab", "Ctrl+Space", "Shift+A"
+fn build_key_string(vk: u32) -> String {
+    let ctrl = is_ctrl_pressed();
+    let shift = is_shift_pressed();
+    let alt = is_alt_pressed();
+    let key_name = vk_to_name(vk);
+
+    let mut parts: Vec<&str> = Vec::new();
+    if ctrl { parts.push("Ctrl"); }
+    if shift { parts.push("Shift"); }
+    if alt { parts.push("Alt"); }
+
+    if parts.is_empty() {
+        key_name
+    } else {
+        format!("{}+{}", parts.join("+"), key_name)
     }
 }
 
@@ -211,7 +272,6 @@ fn get_foreground_process_name() -> Option<String> {
         if pid == 0 {
             return None;
         }
-
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buf = [0u16; 260];
         let mut len = buf.len() as u32;
@@ -220,9 +280,9 @@ fn get_foreground_process_name() -> Option<String> {
             PROCESS_NAME_FORMAT(0),
             windows::core::PWSTR(buf.as_mut_ptr()),
             &mut len,
-        ).ok()?;
+        )
+        .ok()?;
         let _ = windows::Win32::Foundation::CloseHandle(handle);
-
         let path = String::from_utf16_lossy(&buf[..len as usize]);
         path.rsplit('\\').next().map(|s| s.to_string())
     }
@@ -232,19 +292,52 @@ fn is_ctrl_pressed() -> bool {
     unsafe { (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 }
 }
 
+fn is_shift_pressed() -> bool {
+    unsafe { (GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0 }
+}
+
+fn is_alt_pressed() -> bool {
+    unsafe { (GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0 }
+}
+
 fn is_accept_key(event: &KeyEvent, config: &Config) -> bool {
-    let accept_vk = config.accept_vk();
-    match accept_vk {
-        0xFF01 => {
-            // Ctrl+Space
-            event.vk_code == VK_SPACE.0 as u32 && is_ctrl_pressed()
-        }
-        0xFF02 => {
-            // Ctrl+Enter
-            event.vk_code == VK_RETURN.0 as u32 && is_ctrl_pressed()
-        }
-        vk => event.vk_code == vk,
+    let (vk, need_ctrl, need_shift, need_alt) = config.accept_key_parsed();
+
+    // Single special modifier keys (e.g. "RCtrl" used alone)
+    // These arrive as their own VK code without any modifier state check needed
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU, VK_LSHIFT, VK_RSHIFT};
+    let solo_modifier = [
+        VK_LCONTROL.0 as u32, VK_RCONTROL.0 as u32,
+        VK_LMENU.0 as u32, VK_RMENU.0 as u32,
+        VK_LSHIFT.0 as u32, VK_RSHIFT.0 as u32,
+    ];
+    if solo_modifier.contains(&vk) {
+        return event.vk_code == vk;
     }
+
+    if event.vk_code != vk {
+        return false;
+    }
+
+    if need_ctrl && !is_ctrl_pressed() { return false; }
+    if need_shift && !is_shift_pressed() { return false; }
+    if need_alt && !is_alt_pressed() { return false; }
+
+    // If no modifiers required, make sure modifiers aren't accidentally held
+    // (skip this check for Tab since some apps have Shift+Tab)
+    if !need_ctrl && !need_shift && !need_alt {
+        use windows::Win32::UI::Input::KeyboardAndMouse::VK_TAB;
+        if vk == VK_TAB.0 as u32 {
+            // Tab is OK even without explicit modifier check
+            return true;
+        }
+        // For other keys, don't fire if Ctrl is held (might be Ctrl+key shortcut in another app)
+        if is_ctrl_pressed() || is_alt_pressed() {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn handle_event(
@@ -268,14 +361,17 @@ fn handle_event(
 
     match event.vk_code {
         0x08 => {
+            // Backspace
             state.typed_buffer.pop();
         }
         0x0D => {
+            // Enter
             finalize_buffer(state);
             let _ = overlay_tx.send(OverlayCmd::Hide);
             return;
         }
         0x1B => {
+            // Escape
             state.clear_suggestion();
             let _ = overlay_tx.send(OverlayCmd::Hide);
             return;
@@ -295,7 +391,7 @@ fn handle_event(
         }
     }
 
-    // Trim buffer
+    // Trim buffer to last 200 chars
     if state.typed_buffer.len() > 200 {
         let tail: String = state
             .typed_buffer
@@ -311,7 +407,8 @@ fn handle_event(
 
     // Debounce
     let now = Instant::now();
-    if now.duration_since(*last_time) < Duration::from_millis(DEBOUNCE_MS) {
+    let debounce = Duration::from_millis(config.debounce_ms);
+    if now.duration_since(*last_time) < debounce {
         return;
     }
     *last_time = now;
