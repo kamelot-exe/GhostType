@@ -5,6 +5,8 @@ pub struct AppState {
     pub current_suffix: Option<String>,
     pub engine_running: bool,
     pub overlay_visible: bool,
+    #[allow(dead_code)]
+    pub last_auto_completed: Option<String>,
 }
 
 impl AppState {
