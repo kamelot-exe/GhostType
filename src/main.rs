@@ -50,6 +50,16 @@ fn main() {
         return;
     }
 
+    // ── First-run: import embedded dataset if DB is empty ────────────────────
+    if db.count_unigrams() == 0 {
+        println!("First run detected — importing embedded dataset…");
+        let stats = telegram_import::import_embedded(&db);
+        println!(
+            "Dataset ready: {} msgs, {} unigrams, {} bigrams, {} trigrams",
+            stats.messages, stats.unigrams, stats.bigrams, stats.trigrams
+        );
+    }
+
     println!("GhostType starting...");
 
     // Channels
@@ -107,9 +117,9 @@ fn main() {
     println!("Opening settings UI...");
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([480.0, 720.0])
-            .with_min_inner_size([380.0, 400.0])
-            .with_title("GhostType Settings"),
+            .with_inner_size([620.0, 720.0])
+            .with_min_inner_size([480.0, 420.0])
+            .with_title("GhostType"),
         ..Default::default()
     };
 
